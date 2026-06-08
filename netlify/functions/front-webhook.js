@@ -325,33 +325,37 @@ exports.handler = async (event) => {
   }
 
   const eventType = payload.type;
+  // The actual event data is nested inside payload.payload
+  const eventData = payload.payload || {};
   console.log(`Received Front event: ${eventType}`);
+  console.log(`Event data keys: ${JSON.stringify(Object.keys(eventData))}`);
 
   // ── Determine if we should process this event ──────────────────────────────
   let conversationId = null;
   let isManualTag = false;
 
-  // Trigger 1: Inbound email
-  if (eventType === "inbound") {
-    conversationId = payload.conversation?.id;
+  // Trigger 1: Inbound email — Front sends "inbound_received"
+  if (eventType === "inbound_received" || eventType === "inbound") {
+    conversationId = eventData.conversation?.id || eventData.id;
+    console.log(`Inbound email conversation ID: ${conversationId}`);
   }
 
-  // Trigger 2: Tag applied
-  // Front sends event type "tag_added" (not "tag")
+  // Trigger 2: Tag applied — Front sends "tag_added"
   if (eventType === "tag_added" || eventType === "tag") {
-    // Log the full payload structure so we can see exactly where the tag name lives
-    console.log(`Tag event payload: ${JSON.stringify({
-      type: payload.type,
-      tag: payload.tag,
-      tags: payload.tags,
-      conversation_id: payload.conversation?.id,
-      target: payload.target,
+    console.log(`Tag event data: ${JSON.stringify({
+      tag: eventData.tag,
+      tags: eventData.tags,
+      target: eventData.target,
+      conversation: eventData.conversation?.id,
+      source: eventData.source,
     })}`);
-    // Tag name can be in payload.tag.name or payload.tags[0].name depending on Front version
-    const tagName = payload.tag?.name || payload.tags?.[0]?.name || "";
-    console.log(`Tag name detected: "${tagName}" — looking for "${CUSTOMER_ORDER_TAG}"`);
+    // Tag name lives in eventData.tag.name or eventData.tags[0].name
+    const tagName = eventData.tag?.name || eventData.tags?.[0]?.name || "";
+    // Conversation ID lives in eventData.target.data.id (for conversations) or eventData.conversation.id
+    const convId = eventData.target?.data?.id || eventData.conversation?.id || eventData.id;
+    console.log(`Tag name: "${tagName}", conversation: "${convId}"`);
     if (tagName === CUSTOMER_ORDER_TAG) {
-      conversationId = payload.conversation?.id;
+      conversationId = convId;
       isManualTag = true;
       console.log(`Manual "Customer Order" tag applied to ${conversationId}`);
     }
