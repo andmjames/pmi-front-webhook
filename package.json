@@ -1,0 +1,8 @@
+{
+  "name": "pmi-front-webhook",
+  "version": "1.0.0",
+  "description": "Front App webhook handler for PMI Tape order detection",
+  "engines": {
+    "node": ">=18"
+  }
+}
