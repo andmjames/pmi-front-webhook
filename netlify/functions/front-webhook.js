@@ -98,7 +98,8 @@ async function downloadAttachment(attachmentUrl) {
 }
 
 async function postComment(conversationId, comment) {
-  const body = JSON.stringify({ author_id: "alt:email:customerservice@pmitape.com", body: comment });
+  // Use teammate ID (tea_jloke = Andrew James at PMI Tape)
+  const body = JSON.stringify({ author_id: "tea_jloke", body: comment });
   const res = await request(
     "POST",
     `${FRONT_API_BASE}/conversations/${conversationId}/comments`,
