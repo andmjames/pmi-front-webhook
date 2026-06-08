@@ -284,23 +284,28 @@ function verifySignature(rawBody, signatureHeader) {
 
 // ── Main handler ──────────────────────────────────────────────────────────────
 exports.handler = async (event) => {
-  // Front sends a GET request to verify the webhook URL is reachable
+  // Simple GET health check
   if (event.httpMethod === "GET") {
-    const challenge = event.queryStringParameters?.challenge;
-    if (challenge) {
-      // Echo the challenge back exactly as Front expects
-      return {
-        statusCode: 200,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ challenge }),
-      };
-    }
     return { statusCode: 200, body: "PMI Tape Front Webhook — OK" };
   }
 
-  // Only accept POST for actual events
+  // Only accept POST
   if (event.httpMethod !== "POST") {
     return { statusCode: 405, body: "Method Not Allowed" };
+  }
+
+  // ── Front webhook verification ──────────────────────────────────────────────
+  // Front sends a POST with header x-front-challenge during webhook setup.
+  // Must respond with {"challenge": "<value>"} and content-type application/json.
+  const frontChallenge =
+    event.headers["x-front-challenge"] || event.headers["X-Front-Challenge"];
+  if (frontChallenge) {
+    console.log("Front webhook verification challenge received, echoing back");
+    return {
+      statusCode: 200,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ challenge: frontChallenge }),
+    };
   }
 
   const rawBody = event.body || "";
