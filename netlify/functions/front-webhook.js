@@ -1,3 +1,8 @@
+bash
+
+cat /home/claude/pmi-front-webhook/netlify/functions/front-webhook.js
+Output
+
 // PMI Tape — Front App Webhook Handler
 // Handles two triggers:
 //   1. Inbound email event  → Claude classifies → if order, store + comment
@@ -284,7 +289,21 @@ function verifySignature(rawBody, signatureHeader) {
 
 // ── Main handler ──────────────────────────────────────────────────────────────
 exports.handler = async (event) => {
-  // Only accept POST
+  // Front sends a GET request to verify the webhook URL is reachable
+  if (event.httpMethod === "GET") {
+    const challenge = event.queryStringParameters?.challenge;
+    if (challenge) {
+      // Echo the challenge back exactly as Front expects
+      return {
+        statusCode: 200,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ challenge }),
+      };
+    }
+    return { statusCode: 200, body: "PMI Tape Front Webhook — OK" };
+  }
+
+  // Only accept POST for actual events
   if (event.httpMethod !== "POST") {
     return { statusCode: 405, body: "Method Not Allowed" };
   }
