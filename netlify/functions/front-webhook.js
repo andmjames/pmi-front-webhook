@@ -337,8 +337,19 @@ exports.handler = async (event) => {
   }
 
   // Trigger 2: Tag applied
-  if (eventType === "tag") {
-    const tagName = payload.tag?.name || "";
+  // Front sends event type "tag_added" (not "tag")
+  if (eventType === "tag_added" || eventType === "tag") {
+    // Log the full payload structure so we can see exactly where the tag name lives
+    console.log(`Tag event payload: ${JSON.stringify({
+      type: payload.type,
+      tag: payload.tag,
+      tags: payload.tags,
+      conversation_id: payload.conversation?.id,
+      target: payload.target,
+    })}`);
+    // Tag name can be in payload.tag.name or payload.tags[0].name depending on Front version
+    const tagName = payload.tag?.name || payload.tags?.[0]?.name || "";
+    console.log(`Tag name detected: "${tagName}" — looking for "${CUSTOMER_ORDER_TAG}"`);
     if (tagName === CUSTOMER_ORDER_TAG) {
       conversationId = payload.conversation?.id;
       isManualTag = true;
