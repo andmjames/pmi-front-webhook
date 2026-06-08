@@ -349,10 +349,12 @@ exports.handler = async (event) => {
       conversation: eventData.conversation?.id,
       source: eventData.source,
     })}`);
-    // Tag name lives in eventData.tag.name or eventData.tags[0].name
-    const tagName = eventData.tag?.name || eventData.tags?.[0]?.name || "";
-    // Conversation ID lives in eventData.target.data.id (for conversations) or eventData.conversation.id
-    const convId = eventData.target?.data?.id || eventData.conversation?.id || eventData.id;
+    // Tag name is at eventData.target.data.name
+    const tagName = eventData.target?.data?.name || eventData.tag?.name || "";
+    // Conversation ID is eventData.conversation (a string like "cnv_xxx"), not an object
+    const convId = typeof eventData.conversation === "string"
+      ? eventData.conversation
+      : eventData.conversation?.id || eventData.target?.data?.id || "";
     console.log(`Tag name: "${tagName}", conversation: "${convId}"`);
     if (tagName === CUSTOMER_ORDER_TAG) {
       conversationId = convId;
