@@ -1,8 +1,3 @@
-bash
-
-cat /home/claude/pmi-front-webhook/netlify/functions/front-webhook.js
-Output
-
 // PMI Tape — Front App Webhook Handler
 // Handles two triggers:
 //   1. Inbound email event  → Claude classifies → if order, store + comment
