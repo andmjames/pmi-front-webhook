@@ -1,7 +1,10 @@
-// PMI Tape — Front App Webhook Handler v4
+// PMI Tape — Front App Webhook Handler v5
 // Handles two triggers:
 //   1. Inbound email event  → Claude classifies → if order, store + comment
 //   2. "Customer Order" tag → skip classification → store + comment
+//
+// KEY: Returns 200 to Front IMMEDIATELY, then does all work asynchronously.
+// This prevents Front from timing out and disabling the webhook.
 
 const https = require("https");
 const crypto = require("crypto");
@@ -23,9 +26,8 @@ const ACCEPTED_ATTACHMENT_TYPES = [
   "image/tiff",
 ];
 
-// ── Env vars (set in Netlify dashboard) ──────────────────────────────────────
 const FRONT_API_TOKEN = process.env.FRONT_API_TOKEN;
-const FRONT_WEBHOOK_SECRET = process.env.FRONT_WEBHOOK_SECRET; // optional but recommended
+const FRONT_WEBHOOK_SECRET = process.env.FRONT_WEBHOOK_SECRET;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
@@ -33,27 +35,17 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 function request(method, urlStr, headers = {}, body = null) {
   return new Promise((resolve, reject) => {
     const url = new URL(urlStr);
-    const isHttps = url.protocol === "https:";
-    const lib = isHttps ? https : require("http");
-
-    const bodyData =
-      body !== null
-        ? Buffer.isBuffer(body)
-          ? body
-          : Buffer.from(typeof body === "string" ? body : JSON.stringify(body))
-        : null;
-
+    const lib = https;
+    const bodyData = body !== null
+      ? Buffer.isBuffer(body) ? body : Buffer.from(typeof body === "string" ? body : JSON.stringify(body))
+      : null;
     const options = {
       hostname: url.hostname,
-      port: url.port || (isHttps ? 443 : 80),
+      port: url.port || 443,
       path: url.pathname + url.search,
       method,
-      headers: {
-        ...headers,
-        ...(bodyData ? { "Content-Length": bodyData.length } : {}),
-      },
+      headers: { ...headers, ...(bodyData ? { "Content-Length": bodyData.length } : {}) },
     };
-
     const req = lib.request(options, (res) => {
       const chunks = [];
       res.on("data", (c) => chunks.push(c));
@@ -62,7 +54,6 @@ function request(method, urlStr, headers = {}, body = null) {
         resolve({ status: res.statusCode, headers: res.headers, raw, body: raw.toString("utf8") });
       });
     });
-
     req.on("error", reject);
     if (bodyData) req.write(bodyData);
     req.end();
@@ -91,22 +82,14 @@ async function getMessages(conversationId) {
 }
 
 async function downloadAttachment(attachmentUrl) {
-  // Front attachment URLs need auth
   const res = await request("GET", attachmentUrl, { Authorization: `Bearer ${FRONT_API_TOKEN}` });
   if (res.status !== 200) throw new Error(`Attachment download failed: ${res.status}`);
-  return res.raw; // Buffer
+  return res.raw;
 }
 
 async function postComment(conversationId, comment) {
-  // Use teammate ID (tea_jloke = Andrew James at PMI Tape)
   const body = JSON.stringify({ author_id: "tea_jloke", body: comment });
-  const res = await request(
-    "POST",
-    `${FRONT_API_BASE}/conversations/${conversationId}/comments`,
-    frontHeaders(),
-    body
-  );
-  // 204 or 200 both indicate success for Front comments
+  const res = await request("POST", `${FRONT_API_BASE}/conversations/${conversationId}/comments`, frontHeaders(), body);
   if (res.status !== 200 && res.status !== 204 && res.status !== 201) {
     throw new Error(`Front post comment failed: ${res.status} ${res.body}`);
   }
@@ -114,18 +97,11 @@ async function postComment(conversationId, comment) {
 }
 
 async function conversationAlreadyCommented(conversationId) {
-  // Check existing comments to avoid duplicates
-  const res = await request(
-    "GET",
-    `${FRONT_API_BASE}/conversations/${conversationId}/comments`,
-    frontHeaders()
-  );
+  const res = await request("GET", `${FRONT_API_BASE}/conversations/${conversationId}/comments`, frontHeaders());
   if (res.status !== 200) return false;
   const data = JSON.parse(res.body);
   const comments = data._results || data.results || [];
-  return comments.some(
-    (c) => c.body && c.body.includes("Order identified")
-  );
+  return comments.some((c) => c.body && c.body.includes("Order identified"));
 }
 
 // ── Supabase Storage helpers ──────────────────────────────────────────────────
@@ -137,23 +113,13 @@ function supabaseHeaders() {
 }
 
 async function ensureBucketExists() {
-  // Check if bucket exists
-  const listRes = await request(
-    "GET",
-    `${SUPABASE_URL}/storage/v1/bucket/${SUPABASE_BUCKET}`,
-    supabaseHeaders()
-  );
-
-  if (listRes.status === 200) return; // already exists
-
-  // Create bucket (public so the link works without auth)
+  const res = await request("GET", `${SUPABASE_URL}/storage/v1/bucket/${SUPABASE_BUCKET}`, supabaseHeaders());
+  if (res.status === 200) return;
   const createRes = await request(
-    "POST",
-    `${SUPABASE_URL}/storage/v1/bucket`,
+    "POST", `${SUPABASE_URL}/storage/v1/bucket`,
     { ...supabaseHeaders(), "Content-Type": "application/json" },
     JSON.stringify({ id: SUPABASE_BUCKET, name: SUPABASE_BUCKET, public: true })
   );
-
   if (createRes.status !== 200 && createRes.status !== 201) {
     throw new Error(`Bucket create failed: ${createRes.status} ${createRes.body}`);
   }
@@ -161,49 +127,26 @@ async function ensureBucketExists() {
 
 async function uploadToSupabase(fileBuffer, fileName, contentType) {
   await ensureBucketExists();
-
   const uploadRes = await request(
-    "POST",
-    `${SUPABASE_URL}/storage/v1/object/${SUPABASE_BUCKET}/${fileName}`,
-    {
-      ...supabaseHeaders(),
-      "Content-Type": contentType,
-      "x-upsert": "true",
-    },
+    "POST", `${SUPABASE_URL}/storage/v1/object/${SUPABASE_BUCKET}/${fileName}`,
+    { ...supabaseHeaders(), "Content-Type": contentType, "x-upsert": "true" },
     fileBuffer
   );
-
   if (uploadRes.status !== 200 && uploadRes.status !== 201) {
     throw new Error(`Supabase upload failed: ${uploadRes.status} ${uploadRes.body}`);
   }
-
-  // Return the public URL
-  const publicUrl = `${SUPABASE_URL}/storage/v1/object/public/${SUPABASE_BUCKET}/${fileName}`;
-  return publicUrl;
+  return `${SUPABASE_URL}/storage/v1/object/public/${SUPABASE_BUCKET}/${fileName}`;
 }
 
 // ── Email → text file helper ──────────────────────────────────────────────────
 function buildEmailTextFile(conversation, message) {
-  const from = message.from
-    ? `${message.from.name || ""} <${message.from.handle || ""}>`.trim()
-    : "Unknown Sender";
+  const from = message.from ? `${message.from.name || ""} <${message.from.handle || ""}>`.trim() : "Unknown Sender";
   const subject = conversation.subject || "(no subject)";
   const date = message.created_at
     ? new Date(message.created_at * 1000).toLocaleString("en-US", { timeZone: "America/Indiana/Indianapolis" })
     : "Unknown Date";
   const body = message.text || message.body || "(no body)";
-
-  const text = [
-    `FROM:    ${from}`,
-    `TO:      ${ORDERS_INBOX_ADDRESS}`,
-    `DATE:    ${date}`,
-    `SUBJECT: ${subject}`,
-    ``,
-    `─────────────────────────────────────────────────`,
-    ``,
-    body,
-  ].join("\n");
-
+  const text = [`FROM:    ${from}`, `TO:      ${ORDERS_INBOX_ADDRESS}`, `DATE:    ${date}`, `SUBJECT: ${subject}`, ``, `─────────────────────────────────────────────────`, ``, body].join("\n");
   return Buffer.from(text, "utf8");
 }
 
@@ -239,28 +182,15 @@ or
 {"is_order": false, "confidence": "high", "reason": "brief reason"}`;
 
   const res = await request(
-    "POST",
-    "https://api.anthropic.com/v1/messages",
-    {
-      "Content-Type": "application/json",
-      "x-api-key": ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-    },
-    JSON.stringify({
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: 100,
-      messages: [{ role: "user", content: prompt }],
-    })
+    "POST", "https://api.anthropic.com/v1/messages",
+    { "Content-Type": "application/json", "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
+    JSON.stringify({ model: "claude-haiku-4-5-20251001", max_tokens: 100, messages: [{ role: "user", content: prompt }] })
   );
-
   if (res.status !== 200) throw new Error(`Claude API failed: ${res.status} ${res.body}`);
-
   const data = JSON.parse(res.body);
   const text = data.content?.[0]?.text || "{}";
-
   try {
-    const clean = text.replace(/```json|```/g, "").trim();
-    const result = JSON.parse(clean);
+    const result = JSON.parse(text.replace(/```json|```/g, "").trim());
     console.log(`Claude classification: ${JSON.stringify(result)}`);
     return result.is_order === true;
   } catch {
@@ -271,106 +201,15 @@ or
 
 // ── Webhook signature verification ───────────────────────────────────────────
 function verifySignature(rawBody, signatureHeader) {
-  if (!FRONT_WEBHOOK_SECRET) return true; // skip if secret not configured
+  if (!FRONT_WEBHOOK_SECRET) return true;
   if (!signatureHeader) return false;
-  const expected = crypto
-    .createHmac("sha1", FRONT_WEBHOOK_SECRET)
-    .update(rawBody)
-    .digest("hex");
-  return crypto.timingSafeEqual(
-    Buffer.from(signatureHeader),
-    Buffer.from(expected)
-  );
+  const expected = crypto.createHmac("sha1", FRONT_WEBHOOK_SECRET).update(rawBody).digest("hex");
+  return crypto.timingSafeEqual(Buffer.from(signatureHeader), Buffer.from(expected));
 }
 
-// ── Main handler ──────────────────────────────────────────────────────────────
-exports.handler = async (event) => {
-  // Simple GET health check
-  if (event.httpMethod === "GET") {
-    return { statusCode: 200, body: "PMI Tape Front Webhook — OK" };
-  }
-
-  // Only accept POST
-  if (event.httpMethod !== "POST") {
-    return { statusCode: 405, body: "Method Not Allowed" };
-  }
-
-  // ── Front webhook verification ──────────────────────────────────────────────
-  // Front sends a POST with header x-front-challenge during webhook setup.
-  // Must respond with {"challenge": "<value>"} and content-type application/json.
-  const frontChallenge =
-    event.headers["x-front-challenge"] || event.headers["X-Front-Challenge"];
-  if (frontChallenge) {
-    console.log("Front webhook verification challenge received, echoing back");
-    return {
-      statusCode: 200,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ challenge: frontChallenge }),
-    };
-  }
-
-  const rawBody = event.body || "";
-
-  // Verify webhook signature if secret is set
-  const signature = event.headers["x-front-signature"] || event.headers["X-Front-Signature"];
-  if (!verifySignature(rawBody, signature)) {
-    console.error("Invalid webhook signature");
-    return { statusCode: 401, body: "Unauthorized" };
-  }
-
-  let payload;
+// ── All slow work — runs AFTER we've already responded 200 to Front ───────────
+async function processConversation(conversationId, isManualTag) {
   try {
-    payload = JSON.parse(rawBody);
-  } catch {
-    return { statusCode: 400, body: "Invalid JSON" };
-  }
-
-  const eventType = payload.type;
-  // The actual event data is nested inside payload.payload
-  const eventData = payload.payload || {};
-  console.log(`Received Front event: ${eventType}`);
-  console.log(`Event data keys: ${JSON.stringify(Object.keys(eventData))}`);
-
-  // ── Determine if we should process this event ──────────────────────────────
-  let conversationId = null;
-  let isManualTag = false;
-
-  // Trigger 1: Inbound email — Front sends "inbound_received"
-  if (eventType === "inbound_received" || eventType === "inbound") {
-    conversationId = eventData.conversation?.id || eventData.id;
-    console.log(`Inbound email conversation ID: ${conversationId}`);
-  }
-
-  // Trigger 2: Tag applied — Front sends "tag_added"
-  if (eventType === "tag_added" || eventType === "tag") {
-    console.log(`Tag event data: ${JSON.stringify({
-      tag: eventData.tag,
-      tags: eventData.tags,
-      target: eventData.target,
-      conversation: eventData.conversation?.id,
-      source: eventData.source,
-    })}`);
-    // Tag name is at eventData.target.data.name
-    const tagName = eventData.target?.data?.name || eventData.tag?.name || "";
-    // Conversation ID is eventData.conversation (a string like "cnv_xxx"), not an object
-    const convId = typeof eventData.conversation === "string"
-      ? eventData.conversation
-      : eventData.conversation?.id || eventData.target?.data?.id || "";
-    console.log(`Tag name: "${tagName}", conversation: "${convId}"`);
-    if (tagName === CUSTOMER_ORDER_TAG) {
-      conversationId = convId;
-      isManualTag = true;
-      console.log(`Manual "Customer Order" tag applied to ${conversationId}`);
-    }
-  }
-
-  // Nothing to process
-  if (!conversationId) {
-    return { statusCode: 200, body: "Event ignored" };
-  }
-
-  try {
-    // ── Fetch conversation and messages ──────────────────────────────────────
     const [conversation, messagesData] = await Promise.all([
       getConversation(conversationId),
       getMessages(conversationId),
@@ -379,41 +218,33 @@ exports.handler = async (event) => {
     const messages = messagesData._results || messagesData.results || [];
     if (messages.length === 0) {
       console.log("No messages found in conversation");
-      return { statusCode: 200, body: "No messages" };
+      return;
     }
 
-    // Use the first (oldest) message as the order — that's the original customer email
     const originalMessage = messages[messages.length - 1];
     const subject = conversation.subject || "";
     const bodyText = originalMessage.text || originalMessage.body || "";
     const senderEmail = originalMessage.from?.handle || "unknown";
 
-    // ── Deduplicate: skip if already commented ───────────────────────────────
     const alreadyDone = await conversationAlreadyCommented(conversationId);
     if (alreadyDone) {
       console.log("Already commented on this conversation, skipping");
-      return { statusCode: 200, body: "Already processed" };
+      return;
     }
 
-    // ── Classify (skip if manual tag) ────────────────────────────────────────
     if (!isManualTag) {
       const isOrder = await isOrderEmail(subject, bodyText, senderEmail);
       if (!isOrder) {
         console.log("Not identified as an order, skipping");
-        return { statusCode: 200, body: "Not an order" };
+        return;
       }
       console.log("Claude identified as an order");
     }
 
-    // ── Find attachment or use email body ─────────────────────────────────────
     const attachments = originalMessage.attachments || [];
-    const validAttachment = attachments.find((a) =>
-      ACCEPTED_ATTACHMENT_TYPES.includes(a.content_type)
-    );
+    const validAttachment = attachments.find((a) => ACCEPTED_ATTACHMENT_TYPES.includes(a.content_type));
 
-    let fileBuffer;
-    let fileName;
-    let contentType;
+    let fileBuffer, fileName, contentType;
     const timestamp = Date.now();
     const safeSubject = subject.replace(/[^a-zA-Z0-9]/g, "_").slice(0, 40);
 
@@ -430,27 +261,96 @@ exports.handler = async (event) => {
       contentType = "text/plain";
     }
 
-    // ── Upload to Supabase Storage ────────────────────────────────────────────
     console.log(`Uploading to Supabase: ${fileName}`);
     const fileUrl = await uploadToSupabase(fileBuffer, fileName, contentType);
 
-    // ── Build Order Entry app URL ─────────────────────────────────────────────
     const encodedUrl = encodeURIComponent(fileUrl);
     const orderAppUrl = `${ORDER_ENTRY_APP}/?po_file=${encodedUrl}`;
-
-    // ── Post comment to Front ─────────────────────────────────────────────────
     const source = validAttachment ? "attachment" : "email body";
     const comment = `📋 Order identified (${source}). Click to process:\n${orderAppUrl}`;
 
     console.log(`Posting comment to conversation ${conversationId}`);
     await postComment(conversationId, comment);
-
     console.log("Done — comment posted successfully");
-    return { statusCode: 200, body: "OK" };
 
   } catch (err) {
-    console.error("Webhook handler error:", err.message);
-    // Return 200 anyway so Front doesn't retry endlessly
-    return { statusCode: 200, body: `Error handled: ${err.message}` };
+    console.error(`processConversation error for ${conversationId}:`, err.message);
   }
+}
+
+// ── Main handler ──────────────────────────────────────────────────────────────
+exports.handler = async (event) => {
+  // Health check
+  if (event.httpMethod === "GET") {
+    return { statusCode: 200, body: "PMI Tape Front Webhook — OK" };
+  }
+
+  if (event.httpMethod !== "POST") {
+    return { statusCode: 405, body: "Method Not Allowed" };
+  }
+
+  // Front webhook verification challenge
+  const frontChallenge = event.headers["x-front-challenge"] || event.headers["X-Front-Challenge"];
+  if (frontChallenge) {
+    console.log("Front webhook verification challenge received, echoing back");
+    return {
+      statusCode: 200,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ challenge: frontChallenge }),
+    };
+  }
+
+  const rawBody = event.body || "";
+
+  // Signature verification
+  const signature = event.headers["x-front-signature"] || event.headers["X-Front-Signature"];
+  if (!verifySignature(rawBody, signature)) {
+    console.error("Invalid webhook signature");
+    return { statusCode: 200, body: "Ignored" }; // still return 200 to avoid disabling
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(rawBody);
+  } catch {
+    return { statusCode: 200, body: "Invalid JSON" };
+  }
+
+  const eventType = payload.type;
+  const eventData = payload.payload || {};
+  console.log(`Received Front event: ${eventType}`);
+
+  let conversationId = null;
+  let isManualTag = false;
+
+  // Trigger 1: Inbound email
+  if (eventType === "inbound_received" || eventType === "inbound") {
+    conversationId = eventData.conversation?.id || eventData.id;
+    console.log(`Inbound email conversation ID: ${conversationId}`);
+  }
+
+  // Trigger 2: Tag applied
+  if (eventType === "tag_added" || eventType === "tag") {
+    const tagName = eventData.target?.data?.name || eventData.tag?.name || "";
+    const convId = typeof eventData.conversation === "string"
+      ? eventData.conversation
+      : eventData.conversation?.id || "";
+    console.log(`Tag name: "${tagName}", conversation: "${convId}"`);
+    if (tagName === CUSTOMER_ORDER_TAG) {
+      conversationId = convId;
+      isManualTag = true;
+      console.log(`Manual "Customer Order" tag applied to ${conversationId}`);
+    }
+  }
+
+  if (!conversationId) {
+    return { statusCode: 200, body: "Event ignored" };
+  }
+
+  // ── Return 200 to Front immediately, process in background ─────────────────
+  processConversation(conversationId, isManualTag).catch(err => {
+    console.error("Background processing error:", err.message);
+  });
+
+  return { statusCode: 200, body: "Accepted" };
 };
