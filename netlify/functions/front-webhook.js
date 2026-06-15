@@ -1,5 +1,5 @@
 // PMI Tape — Front App Webhook Handler v6
-// Two-phase: returns 200 to Front instantly, then processes via a self-call
+// Two-phase: returns 200 to Front instantly, then processes via a self-call.
 // to a separate background endpoint so Netlify doesn't kill the process.
 
 const https = require("https");
