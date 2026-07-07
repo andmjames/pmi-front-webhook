@@ -1,7 +1,6 @@
-// PMI Tape — Front App Webhook Handler v7
-// Synchronous — does all work within the request, optimized to stay under 5s.
-// Manual tag path: skips Claude, runs in ~2-3s.
-// Auto-detect path: Claude classification adds ~1-2s.
+// PMI Tape — Front App Webhook Handler v8
+// Synchronous, completes within Front's 5-second timeout.
+// Smart attachment selection: prefers PDFs, skips inline/signature images.
 
 const https = require("https");
 const crypto = require("crypto");
@@ -12,15 +11,70 @@ const SUPABASE_BUCKET      = "purchase-orders";
 const ORDER_ENTRY_APP      = "https://pmiorder.netlify.app";
 const CUSTOMER_ORDER_TAG   = "Customer Order";
 const ORDERS_INBOX_ADDRESS = "customerservice@pmitape.com";
-const ACCEPTED_ATTACHMENT_TYPES = [
-  "application/pdf","image/jpeg","image/jpg",
-  "image/png","image/gif","image/webp","image/tiff",
-];
 
-const FRONT_API_TOKEN    = process.env.FRONT_API_TOKEN;
+const FRONT_API_TOKEN      = process.env.FRONT_API_TOKEN;
 const FRONT_WEBHOOK_SECRET = process.env.FRONT_WEBHOOK_SECRET;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
-const ANTHROPIC_API_KEY  = process.env.ANTHROPIC_API_KEY;
+const ANTHROPIC_API_KEY    = process.env.ANTHROPIC_API_KEY;
+
+// ── Attachment selection ──────────────────────────────────────────────────────
+// Filenames that are almost certainly email signatures, not POs
+const SIGNATURE_FILENAME_PATTERNS = [
+  /^image\d+\.(gif|png|jpg|jpeg)$/i,   // image001.gif, image002.png
+  /^untitled\s*attachment/i,            // Untitled attachment, Untitled attachment.gif
+  /signature/i,                         // signature.png, my-signature.gif
+  /^logo\./i,                           // logo.png, logo.gif
+  /^banner\./i,
+  /^header\./i,
+  /^footer\./i,
+];
+
+// Minimum size in bytes for an image to be considered a real document (not a signature)
+// Signatures are typically tiny; a scanned PO page is usually >50KB
+const MIN_DOCUMENT_IMAGE_BYTES = 50000;
+
+function selectBestAttachment(attachments) {
+  if (!attachments || attachments.length === 0) return null;
+
+  // Filter out inline attachments (embedded in email body, e.g. signature images)
+  const nonInline = attachments.filter(a => !a.metadata?.is_inline && !a.is_inline);
+
+  // 1. Prefer PDF — almost all POs come as PDF
+  const pdf = nonInline.find(a => a.content_type === "application/pdf");
+  if (pdf) {
+    console.log(`Selected PDF attachment: ${pdf.filename}`);
+    return pdf;
+  }
+
+  // 2. Filter images — skip known signature filenames and tiny files
+  const images = nonInline.filter(a => /^image\//.test(a.content_type));
+  const poImages = images.filter(a => {
+    const filename = a.filename || "";
+    const isSignatureFilename = SIGNATURE_FILENAME_PATTERNS.some(p => p.test(filename));
+    if (isSignatureFilename) {
+      console.log(`Skipping likely signature: ${filename}`);
+      return false;
+    }
+    // Skip tiny images (likely signatures/logos)
+    const size = a.size || a.content_length || 0;
+    if (size > 0 && size < MIN_DOCUMENT_IMAGE_BYTES) {
+      console.log(`Skipping small image (${size} bytes): ${filename}`);
+      return false;
+    }
+    return true;
+  });
+
+  if (poImages.length > 0) {
+    // Pick the largest image — most likely to be the actual PO
+    const largest = poImages.sort((a, b) => (b.size || 0) - (a.size || 0))[0];
+    console.log(`Selected image attachment: ${largest.filename} (${largest.size || "unknown"} bytes)`);
+    return largest;
+  }
+
+  // 3. Log what we're skipping so we can tune if needed
+  console.log(`No suitable attachment found. Available: ${attachments.map(a => `${a.filename}(${a.content_type},${a.size||"?"}b,inline:${a.is_inline||a.metadata?.is_inline||false})`).join(", ")}`);
+  return null;
+}
 
 // ── HTTP helper ───────────────────────────────────────────────────────────────
 function request(method, urlStr, headers = {}, body = null) {
@@ -115,7 +169,9 @@ async function uploadToSupabase(fileBuffer, fileName, contentType) {
 
 // ── Email body capture ────────────────────────────────────────────────────────
 function buildEmailText(conversation, message) {
-  const from = message.from ? `${message.from.name || ""} <${message.from.handle || ""}>`.trim() : "Unknown";
+  const from = message.from
+    ? `${message.from.name || ""} <${message.from.handle || ""}>`.trim()
+    : "Unknown";
   const date = message.created_at
     ? new Date(message.created_at * 1000).toLocaleString("en-US", { timeZone: "America/Indiana/Indianapolis" })
     : "Unknown";
@@ -138,7 +194,7 @@ async function isOrderEmail(subject, body, sender) {
       model: "claude-haiku-4-5-20251001",
       max_tokens: 100,
       messages: [{ role: "user", content:
-        `Is this email a customer purchase order or product order request to PMI Tape?\n\nFROM: ${sender}\nSUBJECT: ${subject}\nBODY: ${body.slice(0,1500)}\n\nReply ONLY: {"is_order":true} or {"is_order":false}`
+        `Is this email a customer purchase order or product order request to PMI Tape (a tape manufacturer)?\n\nFROM: ${sender}\nSUBJECT: ${subject}\nBODY: ${body.slice(0,1500)}\n\nReply ONLY with JSON: {"is_order":true} or {"is_order":false}`
       }],
     })
   );
@@ -161,9 +217,8 @@ function verifySignature(rawBody, sig) {
 
 // ── Main handler ──────────────────────────────────────────────────────────────
 exports.handler = async (event) => {
-  // Health check
   if (event.httpMethod === "GET") {
-    return { statusCode: 200, body: "PMI Tape Front Webhook v7 — OK" };
+    return { statusCode: 200, body: "PMI Tape Front Webhook v8 — OK" };
   }
   if (event.httpMethod !== "POST") {
     return { statusCode: 200, body: "OK" };
@@ -176,7 +231,6 @@ exports.handler = async (event) => {
     return { statusCode: 200, headers: { "Content-Type": "application/json" }, body: JSON.stringify({ challenge }) };
   }
 
-  // Parse
   let payload;
   try { payload = JSON.parse(event.body || "{}"); }
   catch { return { statusCode: 200, body: "Bad JSON" }; }
@@ -185,7 +239,6 @@ exports.handler = async (event) => {
   const eventData = payload.payload || {};
   console.log(`Event: ${eventType}`);
 
-  // Determine conversation and trigger type
   let conversationId = null;
   let isManualTag = false;
 
@@ -209,7 +262,6 @@ exports.handler = async (event) => {
     return { statusCode: 200, body: "Ignored" };
   }
 
-  // ── Do all work synchronously within the request ──────────────────────────
   try {
     const [conversation, messagesData] = await Promise.all([
       getConversation(conversationId),
@@ -240,18 +292,20 @@ exports.handler = async (event) => {
       console.log("Order detected");
     }
 
-    const validAttachment = (msg.attachments || []).find(a => ACCEPTED_ATTACHMENT_TYPES.includes(a.content_type));
+    // ── Smart attachment selection ─────────────────────────────────────────
+    const validAttachment = selectBestAttachment(msg.attachments);
+
     const timestamp = Date.now();
     const safeSubject = subject.replace(/[^a-zA-Z0-9]/g, "_").slice(0, 40);
 
     let fileBuffer, fileName, contentType;
     if (validAttachment) {
-      console.log(`Downloading: ${validAttachment.filename}`);
       fileBuffer = await downloadAttachment(validAttachment.url);
-      fileName = `${timestamp}_${safeSubject}.${validAttachment.filename?.split(".").pop() || "pdf"}`;
+      const ext = validAttachment.filename?.split(".").pop() || "pdf";
+      fileName = `${timestamp}_${safeSubject}.${ext}`;
       contentType = validAttachment.content_type;
     } else {
-      console.log("Using email body");
+      console.log("No suitable attachment — using email body");
       fileBuffer = buildEmailText(conversation, msg);
       fileName = `${timestamp}_${safeSubject}.txt`;
       contentType = "text/plain";
@@ -260,7 +314,9 @@ exports.handler = async (event) => {
     console.log(`Uploading: ${fileName}`);
     const fileUrl = await uploadToSupabase(fileBuffer, fileName, contentType);
 
-    const comment = `📋 Order identified (${validAttachment ? "attachment" : "email body"}). Click to process:\n${ORDER_ENTRY_APP}/?po_file=${encodeURIComponent(fileUrl)}`;
+    const source = validAttachment ? "attachment" : "email body";
+    const comment = `📋 Order identified (${source}). Click to process:\n${ORDER_ENTRY_APP}/?po_file=${encodeURIComponent(fileUrl)}`;
+
     console.log(`Commenting on ${conversationId}`);
     await postComment(conversationId, comment);
     console.log("Done");
