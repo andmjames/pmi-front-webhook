@@ -1,6 +1,7 @@
-// PMI Tape — Front App Webhook Handler v8
+// PMI Tape — Front App Webhook Handler v9
 // Synchronous, completes within Front's 5-second timeout.
 // Smart attachment selection: prefers PDFs, skips inline/signature images.
+// Claude reads the ACTUAL PDF/image contents to classify — not just the email body.
 
 const https = require("https");
 const crypto = require("crypto");
@@ -17,45 +18,40 @@ const FRONT_WEBHOOK_SECRET = process.env.FRONT_WEBHOOK_SECRET;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const ANTHROPIC_API_KEY    = process.env.ANTHROPIC_API_KEY;
 
+// Max attachment size to send to Claude for classification (keeps us under Front's 5s limit)
+const MAX_CLASSIFY_BYTES = 4 * 1024 * 1024; // 4 MB
+
 // ── Attachment selection ──────────────────────────────────────────────────────
-// Filenames that are almost certainly email signatures, not POs
 const SIGNATURE_FILENAME_PATTERNS = [
-  /^image\d+\.(gif|png|jpg|jpeg)$/i,   // image001.gif, image002.png
-  /^untitled\s*attachment/i,            // Untitled attachment, Untitled attachment.gif
-  /signature/i,                         // signature.png, my-signature.gif
-  /^logo\./i,                           // logo.png, logo.gif
+  /^image\d+\.(gif|png|jpg|jpeg)$/i,
+  /^untitled\s*attachment/i,
+  /signature/i,
+  /^logo\./i,
   /^banner\./i,
   /^header\./i,
   /^footer\./i,
 ];
 
-// Minimum size in bytes for an image to be considered a real document (not a signature)
-// Signatures are typically tiny; a scanned PO page is usually >50KB
 const MIN_DOCUMENT_IMAGE_BYTES = 50000;
 
 function selectBestAttachment(attachments) {
   if (!attachments || attachments.length === 0) return null;
 
-  // Filter out inline attachments (embedded in email body, e.g. signature images)
   const nonInline = attachments.filter(a => !a.metadata?.is_inline && !a.is_inline);
 
-  // 1. Prefer PDF — almost all POs come as PDF
   const pdf = nonInline.find(a => a.content_type === "application/pdf");
   if (pdf) {
     console.log(`Selected PDF attachment: ${pdf.filename}`);
     return pdf;
   }
 
-  // 2. Filter images — skip known signature filenames and tiny files
   const images = nonInline.filter(a => /^image\//.test(a.content_type));
   const poImages = images.filter(a => {
     const filename = a.filename || "";
-    const isSignatureFilename = SIGNATURE_FILENAME_PATTERNS.some(p => p.test(filename));
-    if (isSignatureFilename) {
+    if (SIGNATURE_FILENAME_PATTERNS.some(p => p.test(filename))) {
       console.log(`Skipping likely signature: ${filename}`);
       return false;
     }
-    // Skip tiny images (likely signatures/logos)
     const size = a.size || a.content_length || 0;
     if (size > 0 && size < MIN_DOCUMENT_IMAGE_BYTES) {
       console.log(`Skipping small image (${size} bytes): ${filename}`);
@@ -65,14 +61,12 @@ function selectBestAttachment(attachments) {
   });
 
   if (poImages.length > 0) {
-    // Pick the largest image — most likely to be the actual PO
     const largest = poImages.sort((a, b) => (b.size || 0) - (a.size || 0))[0];
     console.log(`Selected image attachment: ${largest.filename} (${largest.size || "unknown"} bytes)`);
     return largest;
   }
 
-  // 3. Log what we're skipping so we can tune if needed
-  console.log(`No suitable attachment found. Available: ${attachments.map(a => `${a.filename}(${a.content_type},${a.size||"?"}b,inline:${a.is_inline||a.metadata?.is_inline||false})`).join(", ")}`);
+  console.log(`No suitable attachment. Available: ${attachments.map(a => `${a.filename}(${a.content_type},${a.size||"?"}b,inline:${a.is_inline||a.metadata?.is_inline||false})`).join(", ")}`);
   return null;
 }
 
@@ -185,26 +179,97 @@ function buildEmailText(conversation, message) {
   ].join("\n"), "utf8");
 }
 
-// ── Claude classification ─────────────────────────────────────────────────────
-async function isOrderEmail(subject, body, sender) {
+// ── Classification prompt ─────────────────────────────────────────────────────
+const CLASSIFY_PROMPT = `You are triaging the inbox ${ORDERS_INBOX_ADDRESS} for PMI Tape, a manufacturer that SELLS adhesive tape products (pallet tape, split tape, quick-rip tape, dual-tack tape, dispensers) to customers. Brands: PMI, Tape Genie, FloorBond, DeckBond.
+
+Your job: decide whether this email is a CUSTOMER PLACING AN ORDER WITH PMI TAPE.
+
+An attached document (if any) is provided. Judge based on the DOCUMENT CONTENTS above all — the email body is often just "see attached."
+
+Mark is_order = TRUE only if the email or its attachment is:
+- A customer purchase order addressed TO PMI Tape (PMI is the vendor/supplier/"ship from")
+- A customer writing out products and quantities they want to buy
+- A customer releasing against a blanket PO, or a reorder request
+
+Mark is_order = FALSE for everything else, including:
+- An INVOICE, statement, remittance advice, or payment notice (PMI is being billed, or PMI is billing)
+- A purchase order where PMI Tape is the BUYER (PMI ordering from its own vendors — check who the vendor/supplier is)
+- A QUOTE or RFQ (asking for pricing, not yet ordering)
+- Order confirmations, shipping/tracking notices, delivery receipts, packing slips, BOLs
+- Freight/carrier documents, customs paperwork, certificates of analysis, spec sheets
+- Marketing, spam, solicitations, newsletters
+- General questions, complaints, returns, credit requests
+- Internal or automated notifications (Dropbox, DocuSign, banking, software alerts)
+- A reply in a thread that is not itself a new order
+
+Critical checks before answering TRUE:
+1. Is PMI Tape the SELLER on this document (not the buyer)?
+2. Does it identify specific products AND quantities to be purchased?
+3. Is it an order being placed, not a record of one already fulfilled or billed?
+
+Respond with ONLY this JSON, no other text:
+{"is_order": true|false, "doc_type": "purchase_order|invoice|quote|confirmation|shipping|statement|marketing|inquiry|other", "reason": "one short sentence"}`;
+
+// ── Claude classification — reads the attachment, not just the email body ──────
+async function classifyEmail({ subject, body, sender, fileBuffer, contentType, fileName }) {
+  const content = [];
+
+  // Attach the document itself so Claude can read it
+  if (fileBuffer && fileBuffer.length > 0 && fileBuffer.length <= MAX_CLASSIFY_BYTES) {
+    const base64 = fileBuffer.toString("base64");
+    if (contentType === "application/pdf") {
+      content.push({
+        type: "document",
+        source: { type: "base64", media_type: "application/pdf", data: base64 },
+      });
+    } else if (/^image\//.test(contentType)) {
+      const mediaType = contentType === "image/jpg" ? "image/jpeg" : contentType;
+      content.push({
+        type: "image",
+        source: { type: "base64", media_type: mediaType, data: base64 },
+      });
+    }
+    console.log(`Sending ${contentType} (${fileBuffer.length} bytes) to Claude for classification`);
+  } else if (fileBuffer && fileBuffer.length > MAX_CLASSIFY_BYTES) {
+    console.log(`Attachment too large to classify (${fileBuffer.length} bytes) — classifying on email text only`);
+  }
+
+  content.push({
+    type: "text",
+    text: `${CLASSIFY_PROMPT}
+
+--- EMAIL ---
+FROM: ${sender}
+SUBJECT: ${subject}
+ATTACHMENT: ${fileName || "(none)"}
+BODY:
+${(body || "").slice(0, 2000)}`,
+  });
+
   const r = await request(
     "POST", "https://api.anthropic.com/v1/messages",
     { "Content-Type": "application/json", "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
     JSON.stringify({
       model: "claude-haiku-4-5-20251001",
-      max_tokens: 100,
-      messages: [{ role: "user", content:
-        `Is this email a customer purchase order or product order request to PMI Tape (a tape manufacturer)?\n\nFROM: ${sender}\nSUBJECT: ${subject}\nBODY: ${body.slice(0,1500)}\n\nReply ONLY with JSON: {"is_order":true} or {"is_order":false}`
-      }],
+      max_tokens: 200,
+      messages: [{ role: "user", content }],
     })
   );
-  if (r.status !== 200) { console.error(`Claude failed: ${r.status}`); return false; }
+
+  if (r.status !== 200) {
+    console.error(`Claude failed: ${r.status} ${r.body.slice(0, 300)}`);
+    return { is_order: false, doc_type: "other", reason: "classification failed" };
+  }
+
   try {
     const text = JSON.parse(r.body).content?.[0]?.text || "{}";
-    const result = JSON.parse(text.replace(/```json|```/g,"").trim());
+    const result = JSON.parse(text.replace(/```json|```/g, "").trim());
     console.log(`Claude: ${JSON.stringify(result)}`);
-    return result.is_order === true;
-  } catch { return false; }
+    return result;
+  } catch (e) {
+    console.error("Could not parse Claude response");
+    return { is_order: false, doc_type: "other", reason: "unparseable response" };
+  }
 }
 
 // ── Signature verification ────────────────────────────────────────────────────
@@ -218,13 +283,12 @@ function verifySignature(rawBody, sig) {
 // ── Main handler ──────────────────────────────────────────────────────────────
 exports.handler = async (event) => {
   if (event.httpMethod === "GET") {
-    return { statusCode: 200, body: "PMI Tape Front Webhook v8 — OK" };
+    return { statusCode: 200, body: "PMI Tape Front Webhook v9 — OK" };
   }
   if (event.httpMethod !== "POST") {
     return { statusCode: 200, body: "OK" };
   }
 
-  // Front verification challenge
   const challenge = event.headers["x-front-challenge"] || event.headers["X-Front-Challenge"];
   if (challenge) {
     console.log("Challenge received");
@@ -284,23 +348,8 @@ exports.handler = async (event) => {
       return { statusCode: 200, body: "Already done" };
     }
 
-    // ── Smart attachment selection ─────────────────────────────────────────────────────
+    // ── Pick the attachment and download it ONCE ────────────────────────────
     const validAttachment = selectBestAttachment(msg.attachments);
-
-    if (!isManualTag) {
-      // PDF attachment = automatic order (a PDF to customerservice@pmitape.com is almost always a PO)
-      // For text-only emails, ask Claude to classify
-      const hasPdf = validAttachment && validAttachment.content_type === "application/pdf";
-      if (hasPdf) {
-        console.log("PDF attachment — treating as order automatically");
-      } else {
-        if (!await isOrderEmail(subject, bodyText, sender)) {
-          console.log("Not an order");
-          return { statusCode: 200, body: "Not an order" };
-        }
-        console.log("Order detected via Claude");
-      }
-    }
 
     const timestamp = Date.now();
     const safeSubject = subject.replace(/[^a-zA-Z0-9]/g, "_").slice(0, 40);
@@ -316,6 +365,24 @@ exports.handler = async (event) => {
       fileBuffer = buildEmailText(conversation, msg);
       fileName = `${timestamp}_${safeSubject}.txt`;
       contentType = "text/plain";
+    }
+
+    // ── Classify (skip entirely if manually tagged) ─────────────────────────
+    if (!isManualTag) {
+      const verdict = await classifyEmail({
+        subject,
+        body: bodyText,
+        sender,
+        fileBuffer: validAttachment ? fileBuffer : null,
+        contentType,
+        fileName: validAttachment?.filename,
+      });
+
+      if (verdict.is_order !== true) {
+        console.log(`Not an order (${verdict.doc_type}): ${verdict.reason}`);
+        return { statusCode: 200, body: "Not an order" };
+      }
+      console.log(`Order confirmed: ${verdict.reason}`);
     }
 
     console.log(`Uploading: ${fileName}`);
