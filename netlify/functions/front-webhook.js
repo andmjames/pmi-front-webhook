@@ -1,4 +1,4 @@
-// PMI Tape — Front App Webhook Handler v9
+// PMI Tape — Front App Webhook Handler v11
 // Synchronous, completes within Front's 5-second timeout.
 // Smart attachment selection: prefers PDFs, skips inline/signature images.
 // Claude reads the ACTUAL PDF/image contents to classify — not just the email body.
@@ -180,35 +180,70 @@ function buildEmailText(conversation, message) {
 }
 
 // ── Classification prompt ─────────────────────────────────────────────────────
-const CLASSIFY_PROMPT = `You are triaging the inbox ${ORDERS_INBOX_ADDRESS} for PMI Tape, a manufacturer that SELLS adhesive tape products (pallet tape, split tape, quick-rip tape, dual-tack tape, dispensers) to customers. Brands: PMI, Tape Genie, FloorBond, DeckBond.
+const CLASSIFY_PROMPT = `You are triaging the inbox ${ORDERS_INBOX_ADDRESS} for PMI Tape, a manufacturer that SELLS adhesive tape to customers. Product brands: PMI, Tape Genie, FloorBond, DeckBond.
 
 Your job: decide whether this email is a CUSTOMER PLACING AN ORDER WITH PMI TAPE.
 
-An attached document (if any) is provided. Judge based on the DOCUMENT CONTENTS above all — the email body is often just "see attached."
+An attached document (if any) is provided. Judge on the DOCUMENT CONTENTS above all — the email body is usually just "see attached."
 
-Mark is_order = TRUE only if the email or its attachment is:
-- A customer purchase order addressed TO PMI Tape (PMI is the vendor/supplier/"ship from")
+=== START HERE: DIRECTION OF THE EMAIL ===
+This email was RECEIVED at ${ORDERS_INBOX_ADDRESS}, PMI Tape's inbound customer
+service inbox. PMI sends its own purchase orders OUT to its suppliers; those never
+arrive here. Therefore:
+
+  Attached document is a purchase order, received at this inbox
+    -> a customer is ordering FROM PMI Tape
+    -> is_order = TRUE
+
+This holds even when PMI Tape is not named anywhere on the document.
+
+=== DO NOT BE MISLED BY THESE (all are normal and expected) ===
+1. The customer's name and logo appear at the top of the PO. It is THEIR document,
+   printed on THEIR letterhead. This tells you who the BUYER is, not the seller.
+
+2. PMI Tape may not be named as vendor at all. The "Vendor" field often holds only
+   a vendor NUMBER (e.g. "Vendor #: 4021"). Absence of the words "PMI Tape" is NOT
+   evidence that PMI is uninvolved.
+
+3. "PMI" appears inside product names and SKUs — "PMI White Split Tape", "PMI
+   Blackout Tape", "PMI3451", "PMID2". This is PMI's BRAND on the goods being
+   purchased. It is not a statement about who is buying or selling. Seeing PMI in
+   line items alongside a customer's letterhead is exactly what a customer PO to
+   PMI Tape looks like.
+
+4. The sender address may be an automated relay (e.g. system@sent-via.netsuite.com,
+   noreply@ariba.com). Judge the document, not the envelope.
+
+Worked example (a real case):
+  Letterhead: Blue Ridge Screen Products, LLC. Column header: "Vendor #".
+  Line items: "PMI White Split Tape 3x60", "PMI Blackout Tape 3x100YD". Total $7,465.44.
+  Blue Ridge issued this PO on their letterhead. The goods are PMI-brand tape.
+  It was emailed to PMI's customer service inbox.
+  -> A customer is ordering PMI tape from PMI Tape.
+  -> {"is_order": true, "doc_type": "purchase_order", ...}
+
+=== TRUE ===
+- A purchase order for tape products received at this inbox
 - A customer writing out products and quantities they want to buy
-- A customer releasing against a blanket PO, or a reorder request
+- A release against a blanket PO, or a reorder request
 
-Mark is_order = FALSE for everything else, including:
-- An INVOICE, statement, remittance advice, or payment notice (PMI is being billed, or PMI is billing)
-- A purchase order where PMI Tape is the BUYER (PMI ordering from its own vendors — check who the vendor/supplier is)
+=== FALSE ===
+- An INVOICE, statement, remittance advice, or payment notice
+- A purchase order that is clearly PMI Tape's OWN outbound PO to a supplier
+  (PMI Tape on the letterhead as issuer, some other company as vendor)
 - A QUOTE or RFQ (asking for pricing, not yet ordering)
 - Order confirmations, shipping/tracking notices, delivery receipts, packing slips, BOLs
 - Freight/carrier documents, customs paperwork, certificates of analysis, spec sheets
 - Marketing, spam, solicitations, newsletters
 - General questions, complaints, returns, credit requests
-- Internal or automated notifications (Dropbox, DocuSign, banking, software alerts)
+- Automated notifications (Dropbox, DocuSign, banking, software alerts)
 - A reply in a thread that is not itself a new order
 
-Critical checks before answering TRUE:
-1. Is PMI Tape the SELLER on this document (not the buyer)?
-2. Does it identify specific products AND quantities to be purchased?
-3. Is it an order being placed, not a record of one already fulfilled or billed?
+The FALSE purchase-order case is rare. Only choose it when PMI Tape is plainly the
+issuer of the document. If a PO arrived here and lists tape products, it is TRUE.
 
 Respond with ONLY this JSON, no other text:
-{"is_order": true|false, "doc_type": "purchase_order|invoice|quote|confirmation|shipping|statement|marketing|inquiry|other", "reason": "one short sentence"}`;
+{"is_order": true|false, "doc_type": "purchase_order|invoice|quote|confirmation|shipping|statement|marketing|inquiry|other", "issuer": "company whose letterhead is on the doc, or null", "products": "brief note on what goods are listed, or null", "reason": "one short sentence"}`;
 
 // ── Claude classification — reads the attachment, not just the email body ──────
 async function classifyEmail({ subject, body, sender, fileBuffer, contentType, fileName }) {
@@ -283,7 +318,7 @@ function verifySignature(rawBody, sig) {
 // ── Main handler ──────────────────────────────────────────────────────────────
 exports.handler = async (event) => {
   if (event.httpMethod === "GET") {
-    return { statusCode: 200, body: "PMI Tape Front Webhook v9 — OK" };
+    return { statusCode: 200, body: "PMI Tape Front Webhook v11 — OK" };
   }
   if (event.httpMethod !== "POST") {
     return { statusCode: 200, body: "OK" };
@@ -378,11 +413,12 @@ exports.handler = async (event) => {
         fileName: validAttachment?.filename,
       });
 
+      const roles = `issuer=${verdict.issuer || "?"} products=${verdict.products || "?"}`;
       if (verdict.is_order !== true) {
-        console.log(`Not an order (${verdict.doc_type}): ${verdict.reason}`);
+        console.log(`Not an order (${verdict.doc_type}) [${roles}]: ${verdict.reason}`);
         return { statusCode: 200, body: "Not an order" };
       }
-      console.log(`Order confirmed: ${verdict.reason}`);
+      console.log(`Order confirmed [${roles}]: ${verdict.reason}`);
     }
 
     console.log(`Uploading: ${fileName}`);
