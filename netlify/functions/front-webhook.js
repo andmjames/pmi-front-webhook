@@ -1,4 +1,4 @@
-// PMI Tape — Front App Webhook Handler v11
+// PMI Tape — Front App Webhook Handler v13
 // Synchronous, completes within Front's 5-second timeout.
 // Smart attachment selection: prefers PDFs, skips inline/signature images.
 // Claude reads the ACTUAL PDF/image contents to classify — not just the email body.
@@ -316,9 +316,24 @@ function verifySignature(rawBody, sig) {
 }
 
 // ── Main handler ──────────────────────────────────────────────────────────────
+// ── Background handler ────────────────────────────────────────────────────────
+// Invoked by front-webhook.js (not by Front directly). Netlify background
+// functions may run up to 15 minutes, so there is no 5-second pressure here.
+// Input: JSON body { conversationId, isManualTag }.
+// ── Subjects to always ignore (never treated as an order) ─────────────────────
+// Matched case-insensitively anywhere in the subject. Add future patterns here.
+const IGNORE_SUBJECT_PATTERNS = [
+  "home depot us-reg merch has sent an original po",
+];
+
+function subjectIsIgnored(subject) {
+  const s = (subject || "").toLowerCase();
+  return IGNORE_SUBJECT_PATTERNS.some(p => s.includes(p));
+}
+
 exports.handler = async (event) => {
   if (event.httpMethod === "GET") {
-    return { statusCode: 200, body: "PMI Tape Front Webhook v11 — OK" };
+    return { statusCode: 200, body: "PMI Tape Front Webhook v13 — OK" };
   }
   if (event.httpMethod !== "POST") {
     return { statusCode: 200, body: "OK" };
@@ -378,12 +393,19 @@ exports.handler = async (event) => {
     const bodyText = msg.text || msg.body || "";
     const sender = msg.from?.handle || "unknown";
 
+    // ── Hard subject-line block — runs before classification ────────────────
+    // Applies even to auto-detect. NOTE: a manual "Customer Order" tag still
+    // overrides this, so a human can force-process one of these if ever needed.
+    if (!isManualTag && subjectIsIgnored(subject)) {
+      console.log(`Ignored by subject rule: "${subject}"`);
+      return { statusCode: 200, body: "Ignored subject" };
+    }
+
     if (await alreadyCommented(conversationId)) {
       console.log("Already commented");
       return { statusCode: 200, body: "Already done" };
     }
 
-    // ── Pick the attachment and download it ONCE ────────────────────────────
     const validAttachment = selectBestAttachment(msg.attachments);
 
     const timestamp = Date.now();
@@ -402,7 +424,6 @@ exports.handler = async (event) => {
       contentType = "text/plain";
     }
 
-    // ── Classify (skip entirely if manually tagged) ─────────────────────────
     if (!isManualTag) {
       const verdict = await classifyEmail({
         subject,
