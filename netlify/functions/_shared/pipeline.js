@@ -1,4 +1,4 @@
-// PMI Tape — shared Front-webhook pipeline (v15)
+// PMI Tape — shared Front-webhook pipeline (v16)
 // ALL business logic lives here. Both front-webhook.js (front door) and
 // front-webhook-background.js (worker) import from this one file, so there is
 // exactly ONE place to edit classification, attachment rules, or the ignore list.
@@ -376,20 +376,45 @@ async function processConversation(conversationId, isManualTag) {
   console.log("Done");
 }
 
+// Pull a conversation id out of whatever shape Front hands us.
+function extractConversationId(eventData) {
+  const c = eventData.conversation;
+  if (typeof c === "string" && c.startsWith("cnv_")) return c;
+  if (c && typeof c.id === "string") return c.id;
+  if (typeof eventData.id === "string" && eventData.id.startsWith("cnv_")) return eventData.id;
+  return null;
+}
+
 // Parse a Front webhook body into { conversationId, isManualTag } or null.
+// Handles BOTH delivery styles:
+//   • Application webhook (shared inboxes): { type: "inbound_received", payload: { ...event } }
+//   • Rule webhook ("Send to webhook" action, works in private inboxes too):
+//     the event object itself at top level, e.g. { type: "inbound", conversation: {...} }
 function parseFrontEvent(rawBody) {
   let payload;
   try { payload = JSON.parse(rawBody || "{}"); }
   catch { return { error: "bad json" }; }
 
-  const eventType = payload.type;
-  const eventData = payload.payload || {};
-  console.log(`Event: ${eventType}`);
+  const nested = payload.payload && typeof payload.payload === "object";
+  const eventType = payload.type || (nested ? payload.payload.type : undefined);
+  const eventData = nested ? payload.payload : payload;
+  console.log(`Event: ${eventType}${nested ? "" : " (rule webhook)"}`);
 
   if (eventType === "inbound_received" || eventType === "inbound") {
-    const conversationId = eventData.conversation?.id || eventData.id;
+    const conversationId = extractConversationId(eventData);
     console.log(`Inbound conv: ${conversationId}`);
     return { conversationId, isManualTag: false };
+  }
+
+  // A rule webhook may fire on other triggers (e.g. "message received" as
+  // "inbound", or with no recognisable type but a conversation attached).
+  // If it carries a conversation and no tag info, treat it as inbound.
+  if (!nested && !eventType) {
+    const conversationId = extractConversationId(eventData);
+    if (conversationId) {
+      console.log(`Untyped rule event — treating as inbound: ${conversationId}`);
+      return { conversationId, isManualTag: false };
+    }
   }
 
   if (eventType === "tag_added" || eventType === "tag") {
