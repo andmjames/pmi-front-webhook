@@ -1,7 +1,12 @@
-// PMI Tape — shared Front-webhook pipeline (v14)
+// PMI Tape — shared Front-webhook pipeline (v15)
 // ALL business logic lives here. Both front-webhook.js (front door) and
 // front-webhook-background.js (worker) import from this one file, so there is
 // exactly ONE place to edit classification, attachment rules, or the ignore list.
+//
+// v15: adds the reorder-report route. The daily Zoho Analytics email carrying
+// When_to_Order_Items.csv is forwarded to the po-automation edge function
+// (replaces the Zapier "Automatic PO Webhook" Zap). That route is silent — no
+// Front comment — because Front auto-archives that email.
 
 const https = require("https");
 
@@ -11,6 +16,11 @@ const SUPABASE_BUCKET      = "purchase-orders";
 const ORDER_ENTRY_APP      = "https://pmiorder.netlify.app";
 const CUSTOMER_ORDER_TAG   = "Customer Order";
 const ORDERS_INBOX_ADDRESS = "customerservice@pmitape.com";
+
+// ── Reorder report → po-automation (was the Zapier Zap) ───────────────────────
+const PO_AUTOMATION_URL    = `${SUPABASE_URL}/functions/v1/po-automation`;
+// Filename is always exactly When_to_Order_Items.csv; matched loosely anyway.
+const REORDER_CSV_PATTERN  = /when_to_order_items/i;
 
 const FRONT_API_TOKEN      = process.env.FRONT_API_TOKEN;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
@@ -266,6 +276,35 @@ ${(body || "").slice(0, 2000)}` });
   }
 }
 
+// ── Reorder report route ──────────────────────────────────────────────────────
+// Returns true if this message carried the reorder CSV (and was handled), so
+// the caller skips the customer-order flow. Never throws; never comments.
+async function handleReorderReport(msg) {
+  const csv = (msg.attachments || []).find(a => REORDER_CSV_PATTERN.test(a.filename || ""));
+  if (!csv) return false;
+
+  console.log(`Reorder report detected: ${csv.filename} (${csv.size || "?"} bytes)`);
+  try {
+    // Front attachment URLs need our Bearer token, and po-automation fetches
+    // attachment_url WITHOUT auth — so download here and send the CSV inline.
+    const buf = await downloadAttachment(csv.url);
+    const csvText = buf.toString("utf8");
+
+    const r = await request("POST", PO_AUTOMATION_URL,
+      { "Content-Type": "application/json" },
+      JSON.stringify({ csv_text: csvText, filename: csv.filename || "When_to_Order_Items.csv" }));
+
+    if (r.status >= 200 && r.status < 300) {
+      console.log(`po-automation OK (${r.status}): ${r.body.slice(0, 600)}`);
+    } else {
+      console.error(`po-automation FAILED (${r.status}): ${r.body.slice(0, 600)}`);
+    }
+  } catch (e) {
+    console.error(`Reorder report handling error: ${e.message}`);
+  }
+  return true;
+}
+
 // ── The full pipeline (runs in the background worker) ─────────────────────────
 async function processConversation(conversationId, isManualTag) {
   console.log(`Processing ${conversationId} (manualTag=${isManualTag})`);
@@ -283,6 +322,12 @@ async function processConversation(conversationId, isManualTag) {
   const bodyText = msg.text || msg.body || "";
   const sender = msg.from?.handle || "unknown";
 
+  // ── Route 1: daily reorder report (When_to_Order_Items.csv) → po-automation ──
+  // Checked before everything else so the auto-archive rule and the ignore
+  // list never interfere. No Claude call, no comment.
+  if (await handleReorderReport(msg)) return;
+
+  // ── Route 2: customer-order flow ──
   // Hard subject block — auto-detect only; a manual tag still forces it through.
   if (!isManualTag && subjectIsIgnored(subject)) {
     console.log(`Ignored by subject rule: "${subject}"`);
