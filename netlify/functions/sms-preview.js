@@ -9,7 +9,7 @@
 // number only (never the group). Set SMS_PREVIEW_KEY in Netlify env to enable.
 
 const https = require("https");
-const { sendSms, ANDREW, localParts } = require("./_shared/sms");
+const { sendSms, ANDREW } = require("./_shared/sms");
 const { fetchTomorrow, buildForecastMessage } = require("./_shared/weather");
 const { buildDingMessage } = require("./_shared/dings");
 const { MESSAGE: WEEKLY_MESSAGE } = require("./weekly-budget-sms");
@@ -82,8 +82,10 @@ exports.handler = async (event) => {
       else { await sendSms(ANDREW, body); sentNote = `\n\nSENT to ${ANDREW}.`; }
     }
 
-    const lp = localParts();
-    return text(`${body}\n\n${meta}\nLocal time now: ${lp.weekday} ${lp.date} ${lp.hour}:00${sentNote}`);
+    // Preview shows EXACTLY what the text message will contain.
+    // Details go to the function log instead.
+    console.log(`sms-preview ${which} ${meta}`);
+    return text(`${body}${sentNote}`);
   } catch (e) {
     return text(`ERROR: ${e.message}`);
   }
