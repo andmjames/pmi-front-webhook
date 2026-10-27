@@ -46,7 +46,7 @@ function buildDingMessage(subject, msg) {
   }
   if (MONTHLY_DING_SUBJECT.test(subject)) {
     if (amounts.length < 1) { console.error(`Monthly Ding: no amount found in: ${text.slice(0, 200)}`); return null; }
-    return { kind: "monthly", body: `Current Month Bottom Line: ${amounts[amounts.length - 1]}`, recipients: [ANDREW] };
+    return { kind: "monthly", body: `CMBL: ${amounts[amounts.length - 1]}`, recipients: [ANDREW] };
   }
   return null;
 }
