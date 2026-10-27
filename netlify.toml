@@ -1,3 +1,14 @@
 [functions]
   directory = "netlify/functions"
   node_bundler = "esbuild"
+
+# ── Scheduled SMS (cron is UTC; each function checks Indiana local time, so
+#    both the EDT and EST candidate hours are listed and only one sends) ──
+
+# Nightly forecast → Andrew, 8:00 PM local every day
+[functions."forecast-sms"]
+  schedule = "0 0,1 * * *"
+
+# Weekly Budget link → group, Fridays 4:00 PM local
+[functions."weekly-budget-sms"]
+  schedule = "0 20,21 * * 5"

@@ -9,6 +9,7 @@
 // Front comment — because Front auto-archives that email.
 
 const https = require("https");
+const { handleDingEmail } = require("./dings");
 
 const FRONT_API_BASE       = "https://api2.frontapp.com";
 const SUPABASE_URL         = "https://zhvfcipveeeybczzmues.supabase.co";
@@ -322,9 +323,13 @@ async function processConversation(conversationId, isManualTag) {
   const bodyText = msg.text || msg.body || "";
   const sender = msg.from?.handle || "unknown";
 
+  // ── Route 0: "Daily Ding" / "Monthly Bottom Line Ding" → SMS via Twilio ──
+  // Silent (no comment). Weekday-only. See _shared/dings.js.
+  if (await handleDingEmail(subject, msg)) return;
+
   // ── Route 1: daily reorder report (When_to_Order_Items.csv) → po-automation ──
-  // Checked before everything else so the auto-archive rule and the ignore
-  // list never interfere. No Claude call, no comment.
+  // Checked before the customer-order flow so the auto-archive rule and the
+  // ignore list never interfere. No Claude call, no comment.
   if (await handleReorderReport(msg)) return;
 
   // ── Route 2: customer-order flow ──
