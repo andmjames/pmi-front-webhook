@@ -43,7 +43,7 @@ function subjectIsIgnored(subject) {
 // ── Subjects that are ALWAYS a customer PO (skip the Claude classifier) ───────
 // Deterministic senders whose subject line alone identifies a PO.
 const ALWAYS_ORDER_SUBJECT_PATTERNS = [
-  /purchase order\s+AMZ\w+\s+from amazon/i,   // "Purchase Order AMZ1234 from Amazon"
+  /purchase order\s+\S+\s+from amazon/i,   // "Purchase Order AMAZON0001 from Amazon"
 ];
 
 function subjectIsAlwaysOrder(subject) {
@@ -67,7 +67,10 @@ function selectBestAttachment(attachments) {
   if (!attachments || attachments.length === 0) return null;
   const nonInline = attachments.filter(a => !a.metadata?.is_inline && !a.is_inline);
 
-  const pdf = nonInline.find(a => a.content_type === "application/pdf");
+  // Prefer a PDF, but never a labels/packing-slip/BOL PDF when another PDF exists.
+  const pdfs = nonInline.filter(a => a.content_type === "application/pdf" || /\.pdf$/i.test(a.filename || ""));
+  const NON_PO_PDF = /label|packing|bol\b|bill.of.lading|shipping/i;
+  const pdf = pdfs.find(a => !NON_PO_PDF.test(a.filename || "")) || pdfs[0];
   if (pdf) {
     console.log(`Selected PDF attachment: ${pdf.filename}`);
     return pdf;
