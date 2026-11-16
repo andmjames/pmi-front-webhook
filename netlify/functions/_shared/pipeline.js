@@ -40,6 +40,16 @@ function subjectIsIgnored(subject) {
   return IGNORE_SUBJECT_PATTERNS.some(p => s.includes(p));
 }
 
+// ── Subjects that are ALWAYS a customer PO (skip the Claude classifier) ───────
+// Deterministic senders whose subject line alone identifies a PO.
+const ALWAYS_ORDER_SUBJECT_PATTERNS = [
+  /purchase order\s+AMZ\w+\s+from amazon/i,   // "Purchase Order AMZ1234 from Amazon"
+];
+
+function subjectIsAlwaysOrder(subject) {
+  return ALWAYS_ORDER_SUBJECT_PATTERNS.some(re => re.test(subject || ""));
+}
+
 // ── Attachment selection ──────────────────────────────────────────────────────
 const SIGNATURE_FILENAME_PATTERNS = [
   /^image\d+\.(gif|png|jpg|jpeg)$/i,
@@ -358,7 +368,9 @@ async function processConversation(conversationId, isManualTag) {
     contentType = "text/plain";
   }
 
-  if (!isManualTag) {
+  if (!isManualTag && subjectIsAlwaysOrder(subject)) {
+    console.log(`Order confirmed by subject rule: "${subject}"`);
+  } else if (!isManualTag) {
     const verdict = await classifyEmail({
       subject, body: bodyText, sender,
       fileBuffer: validAttachment ? fileBuffer : null,
